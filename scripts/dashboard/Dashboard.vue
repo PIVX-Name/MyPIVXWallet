@@ -14,6 +14,12 @@ import {
     parseBIP21Request,
     sanitizeHTML,
 } from '../misc.js';
+import {
+    isPIVXName,
+    isPIVXNameTLD,
+    PIVXNameTLDs,
+} from '../utils.pins.js';
+import PiNS from './PiNS.vue';
 import { ALERTS, translation, tr } from '../i18n.js';
 import { HardwareWalletMasterKey, HdMasterKey } from '../masterkey';
 import { COIN, cChainParams } from '../chain_params';
@@ -92,6 +98,12 @@ const transferAmount = ref('');
 const showRestoreWallet = ref(false);
 const restoreWalletReason = ref('');
 const importLock = ref(false);
+
+const pinsRef = ref(null);
+
+function onPinsSend(payload) {
+    executeSend(payload.address, payload.amount, payload.useShieldInputs, payload.memo);
+}
 watch(showExportModal, async () => {
     if (showExportModal.value) {
         if (isViewOnly.value && !(await restoreWallet())) {
@@ -304,6 +316,19 @@ async function send(address, amount, useShieldInputs, memo) {
     // Sanity check the receiver
     address = address.trim();
 
+    // Check if the recipient is a domain name with one of the supported TLDs
+    if (isPIVXNameTLD(address)) {
+        if (!isPIVXName(address)) {
+            return createAlert('warning', tr(ALERTS.PINS_INVALID_FORMAT, [{ tlds: PIVXNameTLDs.join(', ') }]), 5000);
+        }
+        pinsRef.value.resolveAndVerify(address, amount, useShieldInputs, memo);
+        return;
+    }
+
+    await executeSend(address, amount, useShieldInputs, memo);
+}
+
+async function executeSend(address, amount, useShieldInputs, memo) {
     // Check for any contacts that match the input
     const cDB = await Database.getInstance();
     const cAccount = await cDB.getAccount(activeWallet.value.getKeyToExport());
@@ -1115,5 +1140,9 @@ defineExpose({
         :reason="restoreWalletReason"
         :wallet="activeWallet"
         @close="showRestoreWallet = false"
+    />
+    <PiNS
+        ref="pinsRef"
+        @send="onPinsSend"
     />
 </template>

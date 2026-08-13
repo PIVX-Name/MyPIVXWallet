@@ -85,6 +85,22 @@ export class Settings {
      * @type {Boolean} The user's transaction mode, `true` for public, `false` for private
      */
     publicMode;
+    /**
+     * @type {String} Name Resolving API url to use
+     */
+    nameResolvingApi;
+    /**
+     * @type {Number} EVM Network ID
+     */
+    evmNetworkId;
+    /**
+     * @type {String} EVM RPC URL
+     */
+    evmRpc;
+    /**
+     * @type {String} EVM Contract Address
+     */
+    evmContractAddress;
 
     /** @type {String} The Cold Address that this account delegates to. */
     coldAddress = '';
@@ -99,6 +115,13 @@ export class Settings {
         autoLockWallet = false,
         publicMode = true,
         coldAddress = '',
+        nameResolvingApi = cChainParams.current.NameResolvers?.[0]?.url ||
+            'https://indexer.pivx.name',
+        evmNetworkId = cChainParams.current.EVMNetworks?.[0]?.chainId || 56,
+        evmRpc = cChainParams.current.EVMNetworks?.[0]?.rpcs?.[0] ||
+            'https://bsc-dataseed.bnbchain.org',
+        evmContractAddress = cChainParams.current.EVMNetworks?.[0]
+            ?.contractAddress || '0x25c7ab6e524a67a9571ac4f02c266658c4e620cb',
     } = {}) {
         this.explorer = explorer;
         this.node = node;
@@ -109,6 +132,10 @@ export class Settings {
         this.autoLockWallet = autoLockWallet;
         this.publicMode = publicMode;
         this.coldAddress = coldAddress;
+        this.nameResolvingApi = nameResolvingApi;
+        this.evmNetworkId = evmNetworkId;
+        this.evmRpc = evmRpc;
+        this.evmContractAddress = evmContractAddress;
     }
 }
 
@@ -152,10 +179,27 @@ export async function start() {
         setTranslation(evt.target.value);
     };
 
+    // Hook up the 'nameResolvingApi' select UI
+    document.getElementById('nameResolvingApi').onchange = function (evt) {
+        setNameResolvingApi(evt.target.value);
+    };
+
+    // Hook up the 'evmNetwork' select UI
+    document.getElementById('evmNetwork').onchange = function (evt) {
+        setEvmNetworkId(Number(evt.target.value));
+    };
+
+    // Hook up the 'evmRpc' select UI
+    document.getElementById('evmRpc').onchange = function (evt) {
+        setEvmRpc(evt.target.value);
+    };
+
     await Promise.all([
         fillExplorerSelect(),
         fillNodeSelect(),
         fillTranslationSelect(),
+        fillNameResolvingApiSelect(),
+        fillEvmNetworkSelect(),
     ]);
 
     const database = await Database.getInstance();
@@ -167,7 +211,10 @@ export async function start() {
         advancedMode,
         autoLockWallet,
         publicMode,
+        evmNetworkId,
     } = await database.getSettings();
+
+    await fillEvmRpcSelect(evmNetworkId);
 
     // Transaction Mode (Public/Private)
     fPublicMode = publicMode;
@@ -239,6 +286,59 @@ export async function setNode(node, fSilent = false) {
             tr(ALERTS.SWITCHED_NODE, [{ node: node.name }]),
             2250
         );
+}
+
+export async function setNameResolvingApi(apiUrl, fSilent = false) {
+    const database = await Database.getInstance();
+    await database.setSettings({ nameResolvingApi: apiUrl });
+
+    if (!fSilent)
+        createAlert(
+            'success',
+            tr(ALERTS.PINS_SWITCHED_API, [{ apiUrl }]),
+            2250
+        );
+}
+
+export async function setEvmNetworkId(networkId, fSilent = false) {
+    const database = await Database.getInstance();
+    
+    // Find contract and default RPC for the selected EVM network
+    const network = cChainParams.current.EVMNetworks?.find(n => n.chainId === networkId);
+    if (!network) return;
+    
+    const newRpc = network.rpcs[0] || '';
+    const newContractAddress = network.contractAddress || '';
+    
+    await database.setSettings({
+        evmNetworkId: networkId,
+        evmRpc: newRpc,
+        evmContractAddress: newContractAddress
+    });
+    
+    // Update the RPC select dropdown in settings page
+    await fillEvmRpcSelect(networkId);
+
+    if (!fSilent) {
+        createAlert(
+            'success',
+            tr(ALERTS.PINS_SWITCHED_EVM, [{ netName: network.name }]),
+            2250
+        );
+    }
+}
+
+export async function setEvmRpc(rpcUrl, fSilent = false) {
+    const database = await Database.getInstance();
+    await database.setSettings({ evmRpc: rpcUrl });
+    
+    if (!fSilent) {
+        createAlert(
+            'success',
+            tr(ALERTS.PINS_SWITCHED_RPC, [{ rpcUrl }]),
+            2250
+        );
+    }
 }
 
 //TRANSLATION
@@ -472,6 +572,62 @@ async function fillNodeSelect() {
             firstNode,
         true
     );
+}
+
+async function fillNameResolvingApiSelect() {
+    const select = document.getElementById('nameResolvingApi');
+    while (select.options.length > 0) {
+        select.remove(0);
+    }
+    const resolvers = cChainParams.current.NameResolvers || [];
+    for (const api of resolvers) {
+        const opt = document.createElement('option');
+        opt.value = api.url;
+        opt.innerHTML = api.name + ' (' + api.url.replace('https://', '').replace('http://', '') + ')';
+        select.appendChild(opt);
+    }
+    const database = await Database.getInstance();
+    const { nameResolvingApi: strSettingApi } = await database.getSettings();
+    select.value = strSettingApi || (resolvers[0] ? resolvers[0].url : 'https://indexer.pivx.name');
+}
+
+async function fillEvmNetworkSelect() {
+    const select = document.getElementById('evmNetwork');
+    if (!select) return;
+    while (select.options.length > 0) {
+        select.remove(0);
+    }
+    const networks = cChainParams.current.EVMNetworks || [];
+    for (const net of networks) {
+        const opt = document.createElement('option');
+        opt.value = net.chainId;
+        opt.innerHTML = `${net.name} (${net.chainId})`;
+        select.appendChild(opt);
+    }
+    const database = await Database.getInstance();
+    const { evmNetworkId } = await database.getSettings();
+    select.value = evmNetworkId || (networks[0] ? networks[0].chainId : 421614);
+}
+
+async function fillEvmRpcSelect(networkId) {
+    const select = document.getElementById('evmRpc');
+    if (!select) return;
+    while (select.options.length > 0) {
+        select.remove(0);
+    }
+    
+    // Find selected network
+    const network = cChainParams.current.EVMNetworks?.find(n => n.chainId === networkId);
+    const rpcs = network ? network.rpcs : [];
+    for (const rpc of rpcs) {
+        const opt = document.createElement('option');
+        opt.value = rpc;
+        opt.innerHTML = rpc;
+        select.appendChild(opt);
+    }
+    const database = await Database.getInstance();
+    const { evmRpc } = await database.getSettings();
+    select.value = evmRpc || (rpcs[0] || '');
 }
 
 /**
