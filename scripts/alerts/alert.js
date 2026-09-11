@@ -84,10 +84,14 @@ export class AlertController {
      * @param {function?} actionFunc - The function to execute if the Action button is used
      */
     createAlert(level, message, timeout = 10000, actionName, actionFunc) {
-        const alert = new Alert({ level, message, timeout, actionName, actionFunc });
-        this.addAlert(
-            alert
-        );
+        const alert = new Alert({
+            level,
+            message,
+            timeout,
+            actionName,
+            actionFunc,
+        });
+        this.addAlert(alert);
         return alert;
     }
 

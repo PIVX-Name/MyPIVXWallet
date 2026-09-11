@@ -143,10 +143,14 @@ export async function start() {
         domBlackBack: document.getElementById('blackBack'),
         domWalletSettings: document.getElementById('settingsWallet'),
         domDisplaySettings: document.getElementById('settingsDisplay'),
-        domNameResolvingSettings: document.getElementById('settingsNameResolving'),
+        domNameResolvingSettings: document.getElementById(
+            'settingsNameResolving'
+        ),
         domWalletSettingsBtn: document.getElementById('settingsWalletBtn'),
         domDisplaySettingsBtn: document.getElementById('settingsDisplayBtn'),
-        domNameResolvingSettingsBtn: document.getElementById('settingsNameResolvingBtn'),
+        domNameResolvingSettingsBtn: document.getElementById(
+            'settingsNameResolvingBtn'
+        ),
         domVersion: document.getElementById('version'),
         domTestnetToggler: document.getElementById('testnetToggler'),
         domAdvancedModeToggler: document.getElementById('advancedModeToggler'),
