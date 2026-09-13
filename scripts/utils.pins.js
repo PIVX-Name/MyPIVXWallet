@@ -1,5 +1,7 @@
 import { Buffer } from 'buffer';
 import { sha256 } from '@noble/hashes/sha256';
+import { bech32 } from 'bech32';
+import { cChainParams } from './chain_params.js';
 
 export function bytesToHex(bytes) {
     return Buffer.from(bytes).toString('hex');
@@ -24,6 +26,38 @@ const EMPTY_NODE = Buffer.alloc(32);
 
 /** A key is 128 bits, so a path can never be longer than that. */
 export const MAX_PROOF_DEPTH = 128;
+
+/** Decoded payload of a Sapling payment address: 11-byte diversifier + 32-byte pk_d. */
+const SAPLING_PAYLOAD_LEN = 43;
+
+/**
+ * How many distinct EVM endpoints must return the same word before a contract read is
+ * acted on.
+ *
+ * One endpoint answering is failover, not agreement: whoever controls that endpoint
+ * controls the wallet's entire view of the chain, and paired with a hostile indexer
+ * that is a fabricated tree which verifies clean. Requiring two independent providers
+ * to be wrong in identical ways is a materially harder position to reach.
+ *
+ * When fewer endpoints than this are reachable the read fails rather than falling back
+ * to one answer - a contract read is only consulted on paths where refusing to send is
+ * the safe outcome. The quorum shrinks only when the user has deliberately configured
+ * fewer endpoints than this, where there is no second opinion to be had.
+ */
+export const MIN_RPC_AGREEMENT = 2;
+
+/**
+ * How far behind the contract's tip an indexer root may be and still back a send, in
+ * PIVX blocks.
+ *
+ * `isRootValid` answers "was this root ever anchored", with no notion of when: a root
+ * from a year ago passes exactly as happily as the current one. That is the whole
+ * gap a replayed historical proof walks through - an indexer that once controlled a
+ * name serving the proof from that era. PIVX targets one block a minute, so 60 blocks
+ * is about an hour: comfortably more than a genuinely lagging indexer needs, far less
+ * than the window a replay wants.
+ */
+export const MAX_ROOT_LAG_BLOCKS = 60;
 
 /**
  * Check if a domain string ends with one of the supported PIVX TLDs
@@ -101,6 +135,60 @@ function u64LE(value) {
 }
 
 /**
+ * Strict Sapling address check, mirroring pins_core::is_address_valid.
+ *
+ * `isShieldAddress` in misc.js asks only whether the string bech32 decodes under the
+ * right prefix, which is the right question for an address a user typed. Here the
+ * string is one field of a leaf preimage handed over by a remote party, so it is
+ * checked the way the circuit checks it: canonical lowercase, the exact prefix and
+ * character count for this network, and a payload of exactly 43 bytes. Character count
+ * and payload length are not the same condition - bech32 pads to 5-bit groups, so
+ * payloads of different byte lengths can share a character count.
+ *
+ * Pinning the length is also what keeps the leaf preimage rigid; see `verifySmtProof`.
+ *
+ * @param {string} strAddress
+ * @returns {boolean}
+ */
+export function isStrictShieldAddress(strAddress) {
+    if (typeof strAddress !== 'string') return false;
+    const strPrefix = cChainParams.current.SHIELD_PREFIX;
+    // 43 bytes is ceil(43*8/5) = 69 data characters, plus 6 of checksum and the
+    // separator - so the address is always the prefix plus 76.
+    if (strAddress.length !== strPrefix.length + 76) return false;
+    // Bech32's checksum is case insensitive, so the uppercase spelling decodes to the
+    // same payload. One address with two spellings is two different leaves.
+    if (strAddress !== strAddress.toLowerCase()) return false;
+    try {
+        const { prefix, words } = bech32.decode(strAddress);
+        if (prefix !== strPrefix) return false;
+        return bech32.fromWords(words).length === SAPLING_PAYLOAD_LEN;
+    } catch (e) {
+        return false;
+    }
+}
+
+/**
+ * `price` and `nonce` are u64 in the leaf. The indexer sends them as JSON numbers, or
+ * as decimal strings once they outgrow what a double holds exactly, and both spellings
+ * have to hash alike - so anything that is not an exact non-negative integer inside the
+ * u64 range is refused before it reaches the hash.
+ */
+function isU64(value) {
+    if (typeof value === 'bigint') {
+        return value >= 0n && value <= 0xffffffffffffffffn;
+    }
+    if (typeof value === 'number') {
+        return Number.isSafeInteger(value) && value >= 0;
+    }
+    if (typeof value === 'string') {
+        if (!/^[0-9]{1,20}$/.test(value)) return false;
+        return BigInt(value) <= 0xffffffffffffffffn;
+    }
+    return false;
+}
+
+/**
  * hash_leaf - must match pins_core::hash_leaf byte for byte.
  * @param {string} strDomain - lowercased domain
  * @param {string} strPubkeyHex - 32-byte owner pubkey, hex
@@ -150,7 +238,23 @@ function fold(key, startHash, arrSiblings) {
 }
 
 /**
- * Verify a compact SMT inclusion proof for a resolved name.
+ * Verify a compact SMT inclusion proof for a resolved name, against a root the caller
+ * has already established as trustworthy.
+ *
+ * `strTrustedRoot` is mandatory and must come from the anchor contract - never from the
+ * response being checked. Folding to the root the same response declared would only
+ * prove that the response agrees with itself: a depth 0 proof whose `smt_root` is its
+ * own leaf hash satisfies that trivially. Taking the root as an argument makes the
+ * binding to the chain part of this function's contract instead of a rule every caller
+ * has to remember.
+ *
+ * Every field of the leaf preimage is checked to an exact shape before it is hashed.
+ * The preimage is a plain concatenation with no length prefixes - it has to be, the
+ * layout is fixed by pins_core and the circuit - so the way to keep its boundaries
+ * rigid is to pin the lengths instead: `price` and `nonce` are 8 bytes each,
+ * `owner_pubkey` is exactly 32, and a target address is exactly one length for the
+ * network. With all of those fixed, the domain's length is fixed too, and no byte can
+ * move from one field into its neighbour while still describing a well formed response.
  *
  * The proof is variable depth: `proof_depth` levels of siblings, with a terminal
  * saying what sits at the bottom. A resolve always answers with `Occupied` - the
@@ -158,14 +262,20 @@ function fold(key, startHash, arrSiblings) {
  * absence proof, so `Vacant` and `Blocked` are rejected here as malformed.
  *
  * The depth is self authenticating: folding the wrong number of times yields a
- * different root, so a shortened or padded proof cannot reproduce `expectedRoot`.
+ * different root, so a shortened or padded proof cannot reproduce the trusted root.
  *
  * @param {object} objResolve - the `response` object from /v1.0/resolve
  * @param {string} strDomain - the name the user asked for (any case)
- * @returns {boolean} true only if the proof folds to the root the indexer published
+ * @param {string} strTrustedRoot - the root to fold against, read from the contract
+ * @returns {boolean} true only if the proof folds to `strTrustedRoot`
  */
-export function verifySmtProof(objResolve, strDomain) {
+export function verifySmtProof(objResolve, strDomain, strTrustedRoot) {
     if (!objResolve || !strDomain) return false;
+
+    // A root that came from outside this response, or nothing to check against.
+    if (typeof strTrustedRoot !== 'string') return false;
+    const strCleanTrusted = strTrustedRoot.replace(/^0x/, '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(strCleanTrusted)) return false;
 
     const {
         target_address: strTargetAddress,
@@ -176,6 +286,7 @@ export function verifySmtProof(objResolve, strDomain) {
         merkle_proof: arrProof,
         proof_depth: nDepth,
         proof_terminal: strTerminal,
+        domain_name: strAnsweredDomain,
     } = objResolve;
 
     if (
@@ -191,6 +302,36 @@ export function verifySmtProof(objResolve, strDomain) {
         return false;
     }
 
+    // One normalisation, used for both the key and the leaf preimage. Deriving them
+    // from differently cased strings would break every proof.
+    const strLower = strDomain.toLowerCase();
+
+    // Only a name the registry could actually hold is worth hashing. The registry's own
+    // rules make valid names prefix free - exactly one dot, and the part after it must
+    // be a whole zone - so no valid name is a byte prefix of another, and the domain
+    // boundary in the preimage cannot slide even before the length checks below.
+    if (!isPIVXName(strLower)) return false;
+
+    // Exactly 32 bytes of hex, nothing more. Buffer.from(..., 'hex') stops at the first
+    // character it cannot decode and silently keeps what it had, so without this the
+    // pubkey could carry trailing junk - or the leading bytes of the target address,
+    // moving a field boundary while the hash stays put.
+    if (!/^[0-9a-fA-F]{64}$/.test(strOwnerPubkey)) return false;
+
+    // Checked here and not only at the call site: the address is part of the preimage,
+    // and fixing its length is what stops the pubkey/target boundary from sliding.
+    if (!isStrictShieldAddress(strTargetAddress)) return false;
+
+    if (!isU64(price) || !isU64(nonce)) return false;
+
+    // If the response names the domain it answered for, it must be the one asked about.
+    if (
+        strAnsweredDomain !== undefined &&
+        String(strAnsweredDomain).toLowerCase() !== strLower
+    ) {
+        return false;
+    }
+
     // A resolve is an inclusion proof or it is nothing.
     if (strTerminal !== 'Occupied') return false;
 
@@ -198,9 +339,14 @@ export function verifySmtProof(objResolve, strDomain) {
     if (!Number.isInteger(nDepth) || nDepth !== arrProof.length) return false;
     if (nDepth > MAX_PROOF_DEPTH) return false;
 
-    // One normalisation, used for both the key and the leaf preimage. Deriving them
-    // from differently cased strings would break every proof.
-    const strLower = strDomain.toLowerCase();
+    // The indexer publishes the root it folded to. It has to be the one the chain
+    // vouched for, or the two are talking about different trees.
+    if (
+        String(strExpectedRoot).replace(/^0x/, '').toLowerCase() !==
+        strCleanTrusted
+    ) {
+        return false;
+    }
 
     let current;
     let arrSiblings;
@@ -222,7 +368,7 @@ export function verifySmtProof(objResolve, strDomain) {
     }
 
     const root = fold(domainKey(strLower), current, arrSiblings);
-    return bytesToHex(root) === strExpectedRoot.toLowerCase();
+    return bytesToHex(root) === strCleanTrusted;
 }
 
 /**
@@ -232,7 +378,8 @@ export function verifySmtProof(objResolve, strDomain) {
 export const EMPTY_ROOT = bytesToHex(EMPTY_NODE);
 
 /**
- * Perform one eth_call, trying each endpoint in turn until one answers.
+ * Perform one eth_call, and do not believe it until `nMinAgree` endpoints have said
+ * the same thing.
  *
  * Every contract read is done client side on purpose: the indexer would otherwise
  * have to make this call for every user from one IP and wear the rate limit alone.
@@ -242,20 +389,39 @@ export const EMPTY_ROOT = bytesToHex(EMPTY_NODE);
  *
  * Rotation happens on transport errors, non-2xx replies, JSON-RPC error objects and
  * empty results. It deliberately does NOT happen on a successful call that returns
- * a zero word: `0x000…0` is a legitimate `false` from isRootValid, and retrying
+ * a zero word: `0x000...0` is a legitimate `false` from isRootValid, and retrying
  * other endpoints until one disagreed would turn "this root is invalid" into "keep
  * asking until somebody says yes".
+ *
+ * With `nMinAgree` above 1 the rotation becomes a quorum: identical answers are tallied
+ * and the first answer to reach the threshold is returned, so a single endpoint - the
+ * one a MITM happens to hold - can no longer decide on its own what the chain says.
+ * Endpoints that disagree are not a reason to keep asking until the desired answer
+ * turns up: if nothing reaches the threshold the call throws, and every caller treats
+ * a throw as "do not send".
  *
  * @param {string|string[]} rpcUrls - endpoints to try, in order
  * @param {string} contractAddress
  * @param {string} strData - abi-encoded calldata, 0x-prefixed
+ * @param {number} nMinAgree - endpoints that must return the same word; capped at the
+ *                             number actually configured
  * @returns {Promise<string>} the raw result word(s), 0x-prefixed
  */
-export async function evmCall(rpcUrls, contractAddress, strData) {
+export async function evmCall(
+    rpcUrls,
+    contractAddress,
+    strData,
+    nMinAgree = 1
+) {
     const arrRpcs = (Array.isArray(rpcUrls) ? rpcUrls : [rpcUrls]).filter(
         (url, i, arr) => url && arr.indexOf(url) === i
     );
     if (!arrRpcs.length) throw new Error('No EVM RPC endpoint configured');
+
+    // A user who configured a single endpoint gets failover semantics; there is no
+    // second opinion to be had, and inventing one by asking the same node twice would
+    // be theatre.
+    const nQuorum = Math.max(1, Math.min(nMinAgree, arrRpcs.length));
 
     const payload = {
         jsonrpc: '2.0',
@@ -271,6 +437,7 @@ export async function evmCall(rpcUrls, contractAddress, strData) {
     };
 
     let lastError = null;
+    const mapAnswers = new Map();
     for (const rpcUrl of arrRpcs) {
         try {
             const response = await fetch(rpcUrl, {
@@ -296,12 +463,22 @@ export async function evmCall(rpcUrls, contractAddress, strData) {
             if (!hexResult || hexResult === '0x') {
                 throw new Error('EVM RPC returned empty result');
             }
-            return hexResult;
+
+            const strKey = hexResult.toLowerCase();
+            const nSeen = (mapAnswers.get(strKey) || 0) + 1;
+            mapAnswers.set(strKey, nSeen);
+            if (nSeen >= nQuorum) return hexResult;
         } catch (e) {
-            // Keep the reason, try the next endpoint. Only if every one of them
-            // fails does the caller hear about it.
+            // Keep the reason, try the next endpoint. Only if the quorum cannot be
+            // reached does the caller hear about it.
             lastError = e;
         }
+    }
+
+    if (mapAnswers.size > 1) {
+        throw new Error(
+            `EVM RPC endpoints disagree: ${mapAnswers.size} different answers, none reached ${nQuorum}`
+        );
     }
 
     throw new Error(
@@ -314,13 +491,27 @@ export async function evmCall(rpcUrls, contractAddress, strData) {
 /**
  * Read the anchor contract's current root, straight from the user's browser.
  *
+ * This is the root every proof is ultimately folded against, so it is read under
+ * quorum: one endpoint's word for what the current root is would otherwise be enough
+ * to point the whole verification at a tree of somebody else's choosing.
+ *
  * @param {string|string[]} rpcUrls
  * @param {string} contractAddress
+ * @param {number} nMinAgree
  * @returns {Promise<string>} the root, lowercase hex, no 0x prefix
  */
-export async function fetchEVMRoot(rpcUrls, contractAddress) {
+export async function fetchEVMRoot(
+    rpcUrls,
+    contractAddress,
+    nMinAgree = MIN_RPC_AGREEMENT
+) {
     // 0xfdab463d is the selector for currentRoot()
-    const hexResult = await evmCall(rpcUrls, contractAddress, '0xfdab463d');
+    const hexResult = await evmCall(
+        rpcUrls,
+        contractAddress,
+        '0xfdab463d',
+        nMinAgree
+    );
     return hexResult.replace(/^0x/, '').toLowerCase();
 }
 
@@ -369,12 +560,14 @@ export async function fetchIndexerRoot(apiEndpoint) {
  * @param {string|string[]} rpcUrls
  * @param {string} contractAddress
  * @param {string} smtRoot
+ * @param {number} nMinAgree
  * @returns {Promise<boolean>}
  */
 export async function verifyRootValidityOnContract(
     rpcUrls,
     contractAddress,
-    smtRoot
+    smtRoot,
+    nMinAgree = MIN_RPC_AGREEMENT
 ) {
     if (!smtRoot) return false;
     // 30ef41b4 is the selector for isRootValid(bytes32)
@@ -382,10 +575,84 @@ export async function verifyRootValidityOnContract(
     const hexResult = await evmCall(
         rpcUrls,
         contractAddress,
-        `0x30ef41b4${cleanRoot.padStart(64, '0')}`
+        `0x30ef41b4${cleanRoot.padStart(64, '0')}`,
+        nMinAgree
     );
 
     // isRootValid returns a single ABI word: 0 for false, 1 for true. A zero here is
     // a real answer from a healthy endpoint, never a reason to ask a different one.
     return BigInt(hexResult) !== 0n;
+}
+
+/**
+ * Ask the contract when a root was accepted, not merely whether it ever was.
+ *
+ * `isRootValid` is a timeless yes/no, which is exactly the property a replay wants: a
+ * root the contract accepted long ago still answers yes today. `verifyRootValidity`
+ * returns the PIVX block height that root covers alongside the flag, and comparing it
+ * with `currentBlockHeight()` turns "this was real at some point" into "this is at most
+ * N blocks behind", which is a statement a user can actually act on.
+ *
+ * Read under quorum for the same reason as the root itself: a single endpoint must not
+ * be able to certify staleness away.
+ *
+ * @param {string|string[]} rpcUrls
+ * @param {string} contractAddress
+ * @param {string} smtRoot
+ * @param {number} nMinAgree
+ * @returns {Promise<{fIsValid: boolean, nBlockHeight: number}>}
+ */
+export async function fetchRootInfo(
+    rpcUrls,
+    contractAddress,
+    smtRoot,
+    nMinAgree = MIN_RPC_AGREEMENT
+) {
+    if (!smtRoot) return { fIsValid: false, nBlockHeight: 0 };
+    // c7179944 is the selector for verifyRootValidity(bytes32)
+    const cleanRoot = smtRoot.replace(/^0x/, '').toLowerCase();
+    const hexResult = await evmCall(
+        rpcUrls,
+        contractAddress,
+        `0xc7179944${cleanRoot.padStart(64, '0')}`,
+        nMinAgree
+    );
+
+    // Two ABI words: (bool isValid, uint32 blockHeight). Reading them as one number
+    // would answer "valid" for any root with a recorded height, whatever the flag says.
+    const strClean = hexResult.replace(/^0x/, '');
+    if (strClean.length < 128) {
+        throw new Error('verifyRootValidity returned a short answer');
+    }
+    return {
+        fIsValid: BigInt(`0x${strClean.slice(0, 64)}`) !== 0n,
+        nBlockHeight: Number(BigInt(`0x${strClean.slice(64, 128)}`)),
+    };
+}
+
+/**
+ * The PIVX block height the contract's current root covers.
+ *
+ * Note this is a height on the PIVX chain, not on the EVM chain the contract lives on:
+ * it is the `end_block_height` of the last batch committed, which is what makes it
+ * directly comparable with the height reported for any historical root.
+ *
+ * @param {string|string[]} rpcUrls
+ * @param {string} contractAddress
+ * @param {number} nMinAgree
+ * @returns {Promise<number>}
+ */
+export async function fetchCurrentBlockHeight(
+    rpcUrls,
+    contractAddress,
+    nMinAgree = MIN_RPC_AGREEMENT
+) {
+    // 367bf2f9 is the selector for currentBlockHeight()
+    const hexResult = await evmCall(
+        rpcUrls,
+        contractAddress,
+        '0x367bf2f9',
+        nMinAgree
+    );
+    return Number(BigInt(hexResult));
 }

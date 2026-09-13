@@ -4,10 +4,13 @@ import { Database } from '../database.js';
 import { createAlert } from '../alerts/alert.js';
 import { isShieldAddress } from '../misc.js';
 import {
+    fetchCurrentBlockHeight,
     fetchEVMRoot,
     fetchIndexerRoot,
+    fetchRootInfo,
     verifyRootValidityOnContract,
     verifySmtProof,
+    MAX_ROOT_LAG_BLOCKS,
 } from '../utils.pins.js';
 import { ALERTS, translation, tr } from '../i18n.js';
 import { cChainParams } from '../chain_params.js';
@@ -131,7 +134,16 @@ async function getPivxNameRoots(
     return { rootsMatch, evmRoot, indexerRoot, isNotFound, resolveData };
 }
 
-function verifyResolvedDetails(strDomain, resolveData) {
+/**
+ * Last gate before a send: the response must be complete, and its proof must fold to a
+ * root the chain vouched for.
+ *
+ * `strTrustedRoot` is always a root read from the anchor contract - either its current
+ * root, or a historical one the contract confirmed AND that is recent enough to still
+ * describe the registry (see `establishTrustedRoot`). It is never the root the indexer
+ * declared in the same breath as the proof.
+ */
+function verifyResolvedDetails(strDomain, resolveData, strTrustedRoot) {
     if (!resolveData) return false;
     const resolvedAddress = resolveData.target_address;
 
@@ -155,7 +167,7 @@ function verifyResolvedDetails(strDomain, resolveData) {
         return false;
     }
 
-    if (!verifySmtProof(resolveData, strDomain)) {
+    if (!verifySmtProof(resolveData, strDomain, strTrustedRoot)) {
         createAlert('warning', ALERTS.PINS_INVALID_PROOF, 5000);
         return false;
     }
@@ -173,6 +185,110 @@ function verifyResolvedDetails(strDomain, resolveData) {
     return true;
 }
 
+/**
+ * Show the "this root was never anchored" wall and make sure nothing can be sent.
+ */
+function blockOnUnanchoredRoot() {
+    stopSyncModalPolling();
+    pendingSendParams.value = null; // Clear to prevent any send
+    showSyncModal.value = true;
+    syncModalState.value = 'invalid_root';
+    syncModalTitle.value = translation.pinsTitleSecurityWarning;
+    syncModalText.value = translation.pinsTextSecurityWarning;
+    syncModalCancelText.value = translation.pinsBtnClose;
+}
+
+/**
+ * Show the "this root is real but far too old to act on" wall.
+ *
+ * Kept separate from the unanchored case on purpose: one says the indexer invented a
+ * tree, the other says the indexer is serving a tree that genuinely existed but has
+ * since been superseded - which is what a replayed proof looks like from here.
+ */
+function blockOnStaleRoot(nLag) {
+    stopSyncModalPolling();
+    pendingSendParams.value = null;
+    showSyncModal.value = true;
+    syncModalState.value = 'invalid_root';
+    syncModalTitle.value = translation.pinsTitleRootTooOld;
+    syncModalText.value = tr(translation.pinsTextRootTooOld, [{ nLag }]);
+    syncModalCancelText.value = translation.pinsBtnClose;
+}
+
+/**
+ * Ask the contract about the root the indexer is serving, and answer with how far
+ * behind the tip it is.
+ *
+ * Returns `null` - after putting the appropriate wall on screen - when the root was
+ * never anchored at all. A number means the root is genuinely part of the contract's
+ * history; how much lag is acceptable is the caller's decision, because the answer
+ * differs between "warn the user" and "let the user send".
+ */
+async function measureRootLag(evmRpcList, evmContractAddress, indexerRoot) {
+    const { fIsValid, nBlockHeight } = await fetchRootInfo(
+        evmRpcList,
+        evmContractAddress,
+        indexerRoot
+    );
+    if (!fIsValid) {
+        blockOnUnanchoredRoot();
+        return null;
+    }
+
+    const nTipHeight = await fetchCurrentBlockHeight(
+        evmRpcList,
+        evmContractAddress
+    );
+    // Heights are PIVX block heights on both sides, so the difference is a lag in
+    // PIVX blocks - roughly a minute each.
+    return Math.max(0, nTipHeight - nBlockHeight);
+}
+
+/**
+ * Decide, at the moment of sending, which root this proof may be folded against.
+ *
+ * The contract's current root is the ideal answer. When the indexer is behind, the
+ * root it serves is acceptable only if the contract confirms it AND it is recent
+ * enough that a replay of some long superseded state cannot hide inside the lag. Both
+ * questions are asked here rather than reused from whenever the modal happened to be
+ * put on screen: between those two moments the chain can have moved, the indexer can
+ * have been swapped, and the user may have left the dialog open for hours.
+ *
+ * @returns {Promise<string|null>} the root to verify against, or null if the user has
+ *                                 already been shown why nothing will be sent
+ */
+async function establishTrustedRoot(
+    evmRpcList,
+    evmContractAddress,
+    indexerRoot
+) {
+    if (!indexerRoot) return null;
+    const strIndexerRoot = String(indexerRoot).replace(/^0x/, '').toLowerCase();
+
+    const strChainRoot = await fetchEVMRoot(evmRpcList, evmContractAddress);
+    if (strChainRoot === strIndexerRoot) return strChainRoot;
+
+    const nLag = await measureRootLag(
+        evmRpcList,
+        evmContractAddress,
+        strIndexerRoot
+    );
+    if (nLag === null) return null;
+    if (nLag > MAX_ROOT_LAG_BLOCKS) {
+        blockOnStaleRoot(nLag);
+        return null;
+    }
+    return strIndexerRoot;
+}
+
+/**
+ * The cheap tripwire used while polling: is this root one the contract ever accepted?
+ *
+ * Deliberately only the boolean read here, not the full lag measurement. This runs on
+ * a timer against public RPC endpoints, and the staleness question is asked where it
+ * changes an outcome - when the warning is raised, and again when the user confirms -
+ * rather than every few seconds.
+ */
 async function verifyAndHandleRootValidity(
     evmRpc,
     evmContractAddress,
@@ -184,13 +300,7 @@ async function verifyAndHandleRootValidity(
         indexerRoot
     );
     if (!isRootValid) {
-        stopSyncModalPolling();
-        pendingSendParams.value = null; // Clear to prevent any send
-        showSyncModal.value = true;
-        syncModalState.value = 'invalid_root';
-        syncModalTitle.value = translation.pinsTitleSecurityWarning;
-        syncModalText.value = translation.pinsTextSecurityWarning;
-        syncModalCancelText.value = translation.pinsBtnClose;
+        blockOnUnanchoredRoot();
         return false;
     }
     return true;
@@ -276,7 +386,9 @@ function startSyncModalPolling(
             );
             handleCriticalError(e);
         }
-    }, 5000);
+        // 10s, not 5: every tick now costs two agreeing endpoints per contract read,
+        // and public BSC endpoints rate limit on per-second concurrency.
+    }, 10000);
 }
 
 function stopSyncModalPolling() {
@@ -291,22 +403,66 @@ function closeSyncModal(confirm) {
     stopSyncModalPolling();
     showSyncModal.value = false;
 
-    if (confirm && pendingSendParams.value) {
-        const {
-            address,
-            amount,
-            useShieldInputs,
-            memo,
-            originalDomain,
-            resolveData,
-        } = pendingSendParams.value;
+    if (!confirm || !pendingSendParams.value) {
         pendingSendParams.value = null;
+        return;
+    }
 
-        if (verifyResolvedDetails(originalDomain, resolveData)) {
-            emit('send', { address, amount, useShieldInputs, memo });
+    // "Send anyway" is a decision taken now, so the chain is asked now. The modal may
+    // have been open for a long time, and the checks that put it on screen say nothing
+    // about the state of the world at the moment the button was pressed.
+    confirmPendingSend();
+}
+
+/**
+ * Re-establish the chain binding, then send.
+ *
+ * Everything that could make this send unsafe is re-derived from the contract here:
+ * which root is current, whether the indexer's root is anchored at all, and how far
+ * behind it is. Only then is the proof folded - against that root, never against the
+ * one the indexer shipped alongside it.
+ */
+async function confirmPendingSend() {
+    const params = pendingSendParams.value;
+    pendingSendParams.value = null;
+    if (!params || !params.resolveData) return;
+
+    const { amount, useShieldInputs, memo, originalDomain, resolveData } =
+        params;
+
+    try {
+        const database = await Database.getInstance();
+        const { evmRpc, evmContractAddress, evmNetworkId } =
+            await database.getSettings();
+        const evmRpcList = getEvmRpcList(evmRpc, evmNetworkId);
+
+        const strTrustedRoot = await establishTrustedRoot(
+            evmRpcList,
+            evmContractAddress,
+            resolveData.smt_root
+        );
+        // A null answer has already explained itself on screen.
+        if (!strTrustedRoot) return;
+
+        if (
+            verifyResolvedDetails(originalDomain, resolveData, strTrustedRoot)
+        ) {
+            // Send to the address the verified leaf commits to, never to a field
+            // carried along separately.
+            emit('send', {
+                address: resolveData.target_address,
+                amount,
+                useShieldInputs,
+                memo,
+            });
         }
-    } else {
-        pendingSendParams.value = null;
+    } catch (e) {
+        debugError(DebugTopics.NET, 'Name service confirmation error:', e);
+        createAlert(
+            'warning',
+            tr(ALERTS.PINS_RESOLVE_FAILED, [{ errMsg: e.message || e }]),
+            5000
+        );
     }
 }
 
@@ -327,11 +483,11 @@ async function retrySyncModalResolution() {
         5000
     );
     try {
-        const { rootsMatch, indexerRoot, isNotFound, resolveData } =
+        const { rootsMatch, evmRoot, indexerRoot, isNotFound, resolveData } =
             await getPivxNameRoots(
                 apiEndpoint,
                 pendingSendParams.value.originalDomain,
-                evmRpc,
+                evmRpcList,
                 evmContractAddress
             );
 
@@ -354,7 +510,8 @@ async function retrySyncModalResolution() {
                 if (
                     verifyResolvedDetails(
                         pendingSendParams.value.originalDomain,
-                        resolveData
+                        resolveData,
+                        evmRoot
                     )
                 ) {
                     emit('send', {
@@ -407,7 +564,7 @@ async function resolveAndVerify(domain, amount, useShieldInputs, memo) {
         const evmRpcList = getEvmRpcList(evmRpc, evmNetworkId);
 
         // 1. Fetch roots and resolved data
-        const { rootsMatch, indexerRoot, isNotFound, resolveData } =
+        const { rootsMatch, evmRoot, indexerRoot, isNotFound, resolveData } =
             await getPivxNameRoots(
                 apiEndpoint,
                 strDomain,
@@ -418,13 +575,19 @@ async function resolveAndVerify(domain, amount, useShieldInputs, memo) {
         if (resolvingAlert) resolvingAlert.close();
 
         if (!rootsMatch) {
-            // Verify if the indexer's root exists historically on the contract
-            const isRootValid = await verifyAndHandleRootValidity(
+            // The indexer is serving a different tree than the chain. Two questions
+            // decide whether that is a lagging indexer or a replayed history: was this
+            // root ever anchored, and how far back does it sit?
+            const nLag = await measureRootLag(
                 evmRpcList,
                 evmContractAddress,
                 indexerRoot
             );
-            if (!isRootValid) return;
+            if (nLag === null) return;
+            if (nLag > MAX_ROOT_LAG_BLOCKS) {
+                blockOnStaleRoot(nLag);
+                return;
+            }
 
             // Roots mismatch! Keep send params for resumption
             pendingSendParams.value = {
@@ -441,7 +604,11 @@ async function resolveAndVerify(domain, amount, useShieldInputs, memo) {
                 showSyncModal.value = true;
                 syncModalState.value = 'warning';
                 syncModalTitle.value = translation.pinsTitleSyncDelay;
-                syncModalText.value = translation.pinsTextSyncDelayResolved;
+                // State exactly how far behind the indexer is: "a few minutes" is a
+                // guess, and it is the number the user is really deciding on.
+                syncModalText.value = `${
+                    translation.pinsTextSyncDelayResolved
+                } ${tr(translation.pinsTextSyncDelayLag, [{ nLag }])}`;
                 syncModalConfirmText.value = translation.pinsBtnSendAnyway;
                 syncModalCancelText.value = translation.pinsBtnCancel;
 
@@ -478,8 +645,9 @@ async function resolveAndVerify(domain, amount, useShieldInputs, memo) {
             );
         }
 
-        // Run cryptographic verification before sending!
-        if (verifyResolvedDetails(strDomain, resolveData)) {
+        // Run cryptographic verification before sending! The roots matched, so the
+        // root the proof is folded against is the contract's own current root.
+        if (verifyResolvedDetails(strDomain, resolveData, evmRoot)) {
             emit('send', {
                 address: resolveData.target_address,
                 amount,

@@ -3,11 +3,16 @@ import {
     verifySmtProof,
     fetchEVMRoot,
     fetchIndexerRoot,
+    fetchRootInfo,
+    fetchCurrentBlockHeight,
     verifyRootValidityOnContract,
+    isStrictShieldAddress,
     evmCall,
     isPIVXName,
     isPIVXNameTLD,
     PIVXNameTLDs,
+    MIN_RPC_AGREEMENT,
+    MAX_ROOT_LAG_BLOCKS,
 } from '../../scripts/utils.pins.js';
 import { mount } from '@vue/test-utils';
 import PiNS from '../../scripts/dashboard/PiNS.vue';
@@ -34,6 +39,9 @@ vi.mock('../../scripts/i18n.js', () => {
         pinsBtnSendAnyway: 'Send anyway',
         pinsBtnCancel: 'Cancel',
         pinsBtnRetry: 'Retry',
+        pinsTitleRootTooOld: 'Outdated Indexer State',
+        pinsTextRootTooOld: 'Root is {nLag} blocks behind, blocked.',
+        pinsTextSyncDelayLag: 'Behind by {nLag} blocks.',
     };
     const ALERTS = {
         PINS_RESOLVING_DOMAIN: 'Resolving {strDomain}...',
@@ -99,17 +107,27 @@ const tamper = (changes) => ({ ...LIVE_VECTOR, ...changes });
 
 describe('verifySmtProof (compact SMT)', () => {
     it('verifies a real proof from the production indexer', () => {
-        expect(verifySmtProof(LIVE_VECTOR, 'alexxiy.pivx')).toBe(true);
+        expect(
+            verifySmtProof(LIVE_VECTOR, 'alexxiy.pivx', LIVE_VECTOR.smt_root)
+        ).toBe(true);
     });
 
     it('accepts the name in any case, normalising once', () => {
-        expect(verifySmtProof(LIVE_VECTOR, 'ALEXXIY.pivx')).toBe(true);
-        expect(verifySmtProof(LIVE_VECTOR, 'Alexxiy.PIVX')).toBe(true);
+        expect(
+            verifySmtProof(LIVE_VECTOR, 'ALEXXIY.pivx', LIVE_VECTOR.smt_root)
+        ).toBe(true);
+        expect(
+            verifySmtProof(LIVE_VECTOR, 'Alexxiy.PIVX', LIVE_VECTOR.smt_root)
+        ).toBe(true);
     });
 
     it('rejects a proof folded for a different name', () => {
-        expect(verifySmtProof(LIVE_VECTOR, 'alexxiy.safe')).toBe(false);
-        expect(verifySmtProof(LIVE_VECTOR, 'alexxi.pivx')).toBe(false);
+        expect(
+            verifySmtProof(LIVE_VECTOR, 'alexxiy.safe', LIVE_VECTOR.smt_root)
+        ).toBe(false);
+        expect(
+            verifySmtProof(LIVE_VECTOR, 'alexxi.pivx', LIVE_VECTOR.smt_root)
+        ).toBe(false);
     });
 
     // Every field below is inside the leaf preimage, so changing any one of them
@@ -122,7 +140,8 @@ describe('verifySmtProof (compact SMT)', () => {
                     target_address:
                         'ps19wd4eft4mw2mlwad6tjrny5hlvtdxymatu2e3dge7jr6scqask0llvdsa3xhx06499vmzymatxq',
                 }),
-                'alexxiy.pivx'
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
             )
         ).toBe(false);
     });
@@ -134,17 +153,26 @@ describe('verifySmtProof (compact SMT)', () => {
                     owner_pubkey:
                         '0000ee1a8b3f10353ca6edd47b66920392b02e323dca3f3edddb5de142079a53',
                 }),
-                'alexxiy.pivx'
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
             )
         ).toBe(false);
     });
 
     it('rejects a tampered price or nonce', () => {
-        expect(verifySmtProof(tamper({ price: 1 }), 'alexxiy.pivx')).toBe(
-            false
-        );
         expect(
-            verifySmtProof(tamper({ nonce: 1786604914 }), 'alexxiy.pivx')
+            verifySmtProof(
+                tamper({ price: 1 }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+        expect(
+            verifySmtProof(
+                tamper({ nonce: 1786604914 }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
         ).toBe(false);
     });
 
@@ -155,7 +183,9 @@ describe('verifySmtProof (compact SMT)', () => {
                 LIVE_VECTOR.merkle_proof[1],
             ],
         });
-        expect(verifySmtProof(bad, 'alexxiy.pivx')).toBe(false);
+        expect(verifySmtProof(bad, 'alexxiy.pivx', LIVE_VECTOR.smt_root)).toBe(
+            false
+        );
     });
 
     it('rejects a tampered root', () => {
@@ -165,7 +195,8 @@ describe('verifySmtProof (compact SMT)', () => {
                     smt_root:
                         '0000bbf778b7c70d7f28af955d28c65165d9b52e2128efdcebdd6f695a773ceb',
                 }),
-                'alexxiy.pivx'
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
             )
         ).toBe(false);
     });
@@ -173,12 +204,20 @@ describe('verifySmtProof (compact SMT)', () => {
     // The depth is self authenticating: folding a different number of times gives a
     // different root. These cases make sure we reject rather than fold blindly.
     it('rejects when proof_depth disagrees with the sibling count', () => {
-        expect(verifySmtProof(tamper({ proof_depth: 2 }), 'alexxiy.pivx')).toBe(
-            false
-        );
-        expect(verifySmtProof(tamper({ proof_depth: 4 }), 'alexxiy.pivx')).toBe(
-            false
-        );
+        expect(
+            verifySmtProof(
+                tamper({ proof_depth: 2 }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+        expect(
+            verifySmtProof(
+                tamper({ proof_depth: 4 }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
     });
 
     it('rejects a depth beyond the 128-bit key length', () => {
@@ -188,7 +227,8 @@ describe('verifySmtProof (compact SMT)', () => {
                     proof_depth: 129,
                     merkle_proof: Array(129).fill(LIVE_VECTOR.merkle_proof[0]),
                 }),
-                'alexxiy.pivx'
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
             )
         ).toBe(false);
     });
@@ -200,32 +240,47 @@ describe('verifySmtProof (compact SMT)', () => {
             expect(
                 verifySmtProof(
                     tamper({ proof_terminal: terminal }),
-                    'alexxiy.pivx'
+                    'alexxiy.pivx',
+                    LIVE_VECTOR.smt_root
                 )
             ).toBe(false);
         }
     });
 
     it('rejects incomplete or malformed responses', () => {
-        expect(verifySmtProof(null, 'alexxiy.pivx')).toBe(false);
-        expect(verifySmtProof(LIVE_VECTOR, '')).toBe(false);
-        expect(
-            verifySmtProof(tamper({ target_address: '' }), 'alexxiy.pivx')
-        ).toBe(false);
-        expect(verifySmtProof(tamper({ smt_root: '' }), 'alexxiy.pivx')).toBe(
+        expect(verifySmtProof(null, 'alexxiy.pivx', LIVE_VECTOR.smt_root)).toBe(
+            false
+        );
+        expect(verifySmtProof(LIVE_VECTOR, '', LIVE_VECTOR.smt_root)).toBe(
             false
         );
         expect(
             verifySmtProof(
+                tamper({ target_address: '' }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+        expect(
+            verifySmtProof(
+                tamper({ smt_root: '' }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+        expect(
+            verifySmtProof(
                 tamper({ merkle_proof: 'not-an-array' }),
-                'alexxiy.pivx'
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
             )
         ).toBe(false);
         // a sibling that is not 32 bytes must be refused, not silently padded
         expect(
             verifySmtProof(
                 tamper({ merkle_proof: ['abcd', LIVE_VECTOR.merkle_proof[1]] }),
-                'alexxiy.pivx'
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
             )
         ).toBe(false);
     });
@@ -235,8 +290,12 @@ describe('verifySmtProof (compact SMT)', () => {
         // the same value, so a Number-based implementation would hash them alike.
         const a = tamper({ price: '18446744073709551615' });
         const b = tamper({ price: '18446744073709551614' });
-        expect(verifySmtProof(a, 'alexxiy.pivx')).toBe(false);
-        expect(verifySmtProof(b, 'alexxiy.pivx')).toBe(false);
+        expect(verifySmtProof(a, 'alexxiy.pivx', LIVE_VECTOR.smt_root)).toBe(
+            false
+        );
+        expect(verifySmtProof(b, 'alexxiy.pivx', LIVE_VECTOR.smt_root)).toBe(
+            false
+        );
         // and neither throws
     });
 
@@ -250,8 +309,212 @@ describe('verifySmtProof (compact SMT)', () => {
                 '0000000000000000000000000000000000000000000000000000000000000000'
             ),
         });
-        expect(verifySmtProof(dense, 'alexxiy.pivx')).toBe(false);
+        expect(
+            verifySmtProof(dense, 'alexxiy.pivx', LIVE_VECTOR.smt_root)
+        ).toBe(false);
         expect(LIVE_VECTOR.merkle_proof.length).not.toBe(128);
+    });
+});
+
+/**
+ * The leaf preimage is a bare concatenation with no length prefixes - that layout is
+ * fixed by pins_core and the SP1 circuit, so it cannot be changed from the wallet side.
+ * What the wallet can do is refuse any response whose fields are not exactly the shape
+ * the protocol defines, which pins every boundary in the preimage and leaves nothing to
+ * slide. These are the slides that would otherwise exist.
+ */
+describe('leaf preimage malleability', () => {
+    const hex = (str) => Buffer.from(str, 'utf8').toString('hex');
+
+    // Buffer.from(x, 'hex') stops at the first character it cannot decode and keeps
+    // what it had, so 'ZZZZ' hashes identically to no suffix at all. The 64-character
+    // rule refuses it before it reaches the hash.
+    it('rejects an owner pubkey with undecodable trailing characters', () => {
+        expect(
+            verifySmtProof(
+                tamper({ owner_pubkey: LIVE_VECTOR.owner_pubkey + 'ZZZZ' }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+    });
+
+    // Move k bytes of the target address into the tail of the pubkey and the leaf hash
+    // is unchanged: same bytes, different boundary. The forged target is a suffix of
+    // the real one, and a 32-byte pubkey is the only pubkey accepted.
+    it('rejects a pubkey that has swallowed the head of the target address', () => {
+        for (const k of [1, 5, 20, 40]) {
+            const slid = tamper({
+                owner_pubkey:
+                    LIVE_VECTOR.owner_pubkey +
+                    hex(LIVE_VECTOR.target_address.slice(0, k)),
+                target_address: LIVE_VECTOR.target_address.slice(k),
+            });
+            expect(
+                verifySmtProof(slid, 'alexxiy.pivx', LIVE_VECTOR.smt_root)
+            ).toBe(false);
+        }
+    });
+
+    // The other end of the same slide: a short pubkey pushes bytes into the target,
+    // which then starts with raw pubkey bytes.
+    it('rejects a pubkey shorter than 32 bytes', () => {
+        expect(
+            verifySmtProof(
+                tamper({ owner_pubkey: LIVE_VECTOR.owner_pubkey.slice(0, 60) }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+    });
+
+    // The "prefix collision": hash_leaf('alexxiy.pivxfoo.safe', P, T, ...) is byte for
+    // byte hash_leaf('alexxiy.pivx', hex('foo.safe') + P, T, ...). It needs a name with
+    // a dot inside the label to exist in the tree, which the registry refuses at every
+    // layer - but the wallet does not take that on trust either.
+    it('rejects a domain/pubkey boundary slide', () => {
+        expect(
+            verifySmtProof(
+                tamper({
+                    owner_pubkey: hex('foo.safe') + LIVE_VECTOR.owner_pubkey,
+                }),
+                'alexxiy.pivx',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+    });
+
+    // Names that could carry such a collision are not names at all.
+    it('refuses to verify anything that is not a registrable name', () => {
+        expect(
+            verifySmtProof(
+                LIVE_VECTOR,
+                'alexxiy.pivxfoo.safe',
+                LIVE_VECTOR.smt_root
+            )
+        ).toBe(false);
+        expect(
+            verifySmtProof(LIVE_VECTOR, 'alexxiy..pivx', LIVE_VECTOR.smt_root)
+        ).toBe(false);
+    });
+
+    // pins_core's rules make the valid-name set prefix free: exactly one dot, and
+    // everything after it must be a whole zone. Extend any valid name by any byte and
+    // the zone stops being a zone. Without that property the domain boundary could
+    // slide even with every length pinned, so it is asserted, not assumed.
+    it('no valid name is a byte prefix of another valid name', () => {
+        const names = [];
+        for (const tld of PIVXNameTLDs) {
+            for (const label of ['a', 'ab', 'a-b', 'z0', 'alexxiy']) {
+                names.push(label + tld);
+            }
+        }
+        for (const short of names) {
+            // every one-to-three character extension of a valid name
+            const chars = 'abz0-.'.split('');
+            let arrExt = [''];
+            for (let depth = 0; depth < 3; depth++) {
+                arrExt = arrExt.flatMap((e) => chars.map((c) => e + c));
+                for (const ext of arrExt) {
+                    expect(isPIVXName(short + ext)).toBe(false);
+                }
+            }
+        }
+    });
+
+    // price and nonce are the two fixed-width fields; anything that is not an exact
+    // u64 would have to be coerced, and a coercion is a second spelling of a value.
+    it('rejects a price or nonce that is not an exact u64', () => {
+        for (const bad of [
+            -1,
+            1.5,
+            '0x10',
+            '1e3',
+            ' 1',
+            '18446744073709551616',
+            true,
+            {},
+        ]) {
+            expect(
+                verifySmtProof(
+                    tamper({ nonce: bad }),
+                    'alexxiy.pivx',
+                    LIVE_VECTOR.smt_root
+                )
+            ).toBe(false);
+        }
+    });
+
+    it('rejects a target address that is not exactly one Sapling address', () => {
+        for (const bad of [
+            LIVE_VECTOR.target_address.slice(0, -1),
+            LIVE_VECTOR.target_address + 'a',
+            LIVE_VECTOR.target_address.toUpperCase(),
+            'ps1' + 'q'.repeat(75),
+        ]) {
+            expect(isStrictShieldAddress(bad)).toBe(false);
+        }
+        expect(isStrictShieldAddress(LIVE_VECTOR.target_address)).toBe(true);
+    });
+});
+
+/**
+ * The proof must fold to a root the chain vouched for. Folding to the root the same
+ * response declared proves only that the response agrees with itself.
+ */
+describe('trusted root binding', () => {
+    it('refuses to verify without a root from the caller', () => {
+        expect(verifySmtProof(LIVE_VECTOR, 'alexxiy.pivx')).toBe(false);
+        expect(verifySmtProof(LIVE_VECTOR, 'alexxiy.pivx', '')).toBe(false);
+        expect(verifySmtProof(LIVE_VECTOR, 'alexxiy.pivx', 'not-a-root')).toBe(
+            false
+        );
+    });
+
+    it('rejects a proof that folds to a different root than the chain reports', () => {
+        expect(
+            verifySmtProof(
+                LIVE_VECTOR,
+                'alexxiy.pivx',
+                '1111111111111111111111111111111111111111111111111111111111111111'
+            )
+        ).toBe(false);
+    });
+
+    /**
+     * The vacuous proof: depth 0, with `smt_root` set to the response's own leaf hash,
+     * so it folds to its own declared root. Internally consistent, and worth nothing.
+     *
+     * `c1427a59...` is SHA256(0x00 || 'alexxiy.pivx' || pubkey || target || 0u64 ||
+     * 1786604913u64) - the live vector's own leaf. Against the chain's root it is
+     * refused, which is the only judgement that matters: the root is no longer
+     * something the response gets to supply.
+     */
+    it('rejects a self-rooted depth-0 proof against the chain root', () => {
+        const selfRooted = tamper({
+            merkle_proof: [],
+            proof_depth: 0,
+            smt_root:
+                'c1427a5973e100b84eca8f44ed1e3a7be635e46a3154f076e3861e59fcbde16e',
+        });
+        // it really is self-consistent: fold of nothing is the leaf itself
+        expect(
+            verifySmtProof(selfRooted, 'alexxiy.pivx', selfRooted.smt_root)
+        ).toBe(true);
+        // ...and that buys it nothing, because the root comes from the contract
+        expect(
+            verifySmtProof(selfRooted, 'alexxiy.pivx', LIVE_VECTOR.smt_root)
+        ).toBe(false);
+    });
+
+    it('accepts the 0x-prefixed spelling of the same root', () => {
+        expect(
+            verifySmtProof(
+                LIVE_VECTOR,
+                'alexxiy.pivx',
+                '0x' + LIVE_VECTOR.smt_root.toUpperCase()
+            )
+        ).toBe(true);
     });
 });
 
@@ -474,7 +737,14 @@ describe('PiNS.vue Component', () => {
      * starts the chain read and the resolve concurrently, so ordering is not a
      * stable thing to assert on.
      */
-    function routeFetch({ resolve, indexerRoot, evmRoot, rootValid }) {
+    function routeFetch({
+        resolve,
+        indexerRoot,
+        evmRoot,
+        rootValid,
+        rootHeight = 1000,
+        tipHeight = 1000,
+    }) {
         fetch.mockImplementation(async (url, opts) => {
             const body = opts?.body ? JSON.parse(opts.body) : null;
             if (String(url).includes('/v1.0/resolve/')) {
@@ -502,6 +772,27 @@ describe('PiNS.vue Component', () => {
                     }),
                 };
             }
+            // verifyRootValidity(bytes32) -> (bool isValid, uint32 blockHeight)
+            if (data.startsWith('0xc7179944')) {
+                return {
+                    ok: true,
+                    json: async () => ({
+                        result:
+                            '0x' +
+                            (rootValid ? '1' : '0').padStart(64, '0') +
+                            rootHeight.toString(16).padStart(64, '0'),
+                    }),
+                };
+            }
+            // currentBlockHeight()
+            if (data.startsWith('0x367bf2f9')) {
+                return {
+                    ok: true,
+                    json: async () => ({
+                        result: '0x' + tipHeight.toString(16).padStart(64, '0'),
+                    }),
+                };
+            }
             throw new Error('unexpected fetch: ' + url + ' ' + data);
         });
     }
@@ -524,6 +815,113 @@ describe('PiNS.vue Component', () => {
         expect(wrapper.vm.syncModalTitle).toBe('Security Warning');
         // no send may be armed once the root is rejected
         expect(wrapper.vm.pendingSendParams).toBe(null);
+    });
+
+    /**
+     * The replay the review describes: a hostile indexer serves a proof under a root
+     * that really was anchored once - back when it controlled the name - so
+     * `isRootValid` says yes forever. What it cannot fake is how old that root is.
+     */
+    it('refuses a root that is anchored but far behind the tip', async () => {
+        routeFetch({
+            resolve: { response: LIVE_VECTOR },
+            indexerRoot: LIVE_VECTOR.smt_root,
+            evmRoot:
+                '1111000000000000000000000000000000000000000000000000000000000000',
+            rootValid: true,
+            rootHeight: 1000,
+            tipHeight: 1000 + MAX_ROOT_LAG_BLOCKS + 1,
+        });
+
+        const wrapper = mount(PiNS);
+        await wrapper.vm.resolveAndVerify('alexxiy.pivx', 1, false, '');
+        await vi.runOnlyPendingTimersAsync();
+
+        expect(wrapper.vm.syncModalTitle).toBe('Outdated Indexer State');
+        expect(wrapper.vm.pendingSendParams).toBe(null);
+        expect(wrapper.emitted('send')).toBeUndefined();
+    });
+
+    it('offers "send anyway" when the lag is small, and states it', async () => {
+        routeFetch({
+            resolve: { response: LIVE_VECTOR },
+            indexerRoot: LIVE_VECTOR.smt_root,
+            evmRoot:
+                '1111000000000000000000000000000000000000000000000000000000000000',
+            rootValid: true,
+            rootHeight: 1000,
+            tipHeight: 1003,
+        });
+
+        const wrapper = mount(PiNS);
+        await wrapper.vm.resolveAndVerify('alexxiy.pivx', 1, false, '');
+        await vi.runOnlyPendingTimersAsync();
+
+        expect(wrapper.vm.syncModalState).toBe('warning');
+        expect(wrapper.vm.syncModalText).toContain('Behind by 3 blocks.');
+        expect(wrapper.vm.pendingSendParams).not.toBe(null);
+    });
+
+    /**
+     * Confirming is a decision taken now, so the chain is asked now. If the root went
+     * stale while the dialog sat open, the confirmation must not go through on the
+     * strength of the check that put the dialog on screen.
+     */
+    it('re-checks the chain when "send anyway" is pressed, not just when shown', async () => {
+        routeFetch({
+            resolve: { response: LIVE_VECTOR },
+            indexerRoot: LIVE_VECTOR.smt_root,
+            evmRoot:
+                '1111000000000000000000000000000000000000000000000000000000000000',
+            rootValid: true,
+            rootHeight: 1000,
+            tipHeight: 1003,
+        });
+
+        const wrapper = mount(PiNS);
+        await wrapper.vm.resolveAndVerify('alexxiy.pivx', 1, false, '');
+        await vi.runOnlyPendingTimersAsync();
+        expect(wrapper.vm.syncModalState).toBe('warning');
+
+        // the chain moves on while the modal is open: the same root is now ancient
+        routeFetch({
+            resolve: { response: LIVE_VECTOR },
+            indexerRoot: LIVE_VECTOR.smt_root,
+            evmRoot:
+                '1111000000000000000000000000000000000000000000000000000000000000',
+            rootValid: true,
+            rootHeight: 1000,
+            tipHeight: 1000 + MAX_ROOT_LAG_BLOCKS + 5,
+        });
+
+        wrapper.vm.closeSyncModal(true);
+        await vi.runOnlyPendingTimersAsync();
+
+        expect(wrapper.emitted('send')).toBeUndefined();
+        expect(wrapper.vm.syncModalTitle).toBe('Outdated Indexer State');
+    });
+
+    it('sends when the confirmation still checks out', async () => {
+        routeFetch({
+            resolve: { response: LIVE_VECTOR },
+            indexerRoot: LIVE_VECTOR.smt_root,
+            evmRoot:
+                '1111000000000000000000000000000000000000000000000000000000000000',
+            rootValid: true,
+            rootHeight: 1000,
+            tipHeight: 1003,
+        });
+
+        const wrapper = mount(PiNS);
+        await wrapper.vm.resolveAndVerify('alexxiy.pivx', 1, false, '');
+        await vi.runOnlyPendingTimersAsync();
+
+        wrapper.vm.closeSyncModal(true);
+        await vi.runOnlyPendingTimersAsync();
+
+        expect(wrapper.emitted('send')?.[0]?.[0]?.address).toBe(
+            LIVE_VECTOR.target_address
+        );
     });
 
     it('never calls /v1.0/info', async () => {
@@ -634,10 +1032,11 @@ describe('EVM RPC rotation', () => {
         expect(fetch).toHaveBeenCalledTimes(1);
     });
 
-    // The critical one. A zero word is isRootValid answering "no". Rotating on it
-    // would mean shopping around until some endpoint said yes - turning a security
-    // verdict into a poll of whoever is reachable.
-    it('does NOT rotate when the contract legitimately answers false', async () => {
+    // The critical one. A zero word is isRootValid answering "no". Shopping around on
+    // it would mean asking until some endpoint said yes - turning a security verdict
+    // into a poll of whoever is reachable. Two endpoints agreeing on "no" settles it;
+    // the third is never asked.
+    it('does NOT keep asking when the contract legitimately answers false', async () => {
         fetch.mockResolvedValue({
             ok: true,
             json: async () => ({ result: '0x' + '0'.repeat(64) }),
@@ -648,16 +1047,93 @@ describe('EVM RPC rotation', () => {
             LIVE_VECTOR.smt_root
         );
         expect(valid).toBe(false);
-        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(fetch).toHaveBeenCalledTimes(MIN_RPC_AGREEMENT);
     });
 
     it('rotation is transparent to fetchEVMRoot', async () => {
-        fetch.mockRejectedValueOnce(new Error('down')).mockResolvedValueOnce({
+        fetch.mockRejectedValueOnce(new Error('down')).mockResolvedValue({
             ok: true,
             json: async () => ({ result: '0x' + LIVE_VECTOR.smt_root }),
         });
         await expect(fetchEVMRoot(RPCS, '0xcontract')).resolves.toBe(
             LIVE_VECTOR.smt_root
         );
+    });
+});
+
+/**
+ * A single endpoint answering is failover, not agreement. These cover the part the
+ * quorum exists for: one compromised or MITM'd endpoint, on its own, decides nothing.
+ */
+describe('EVM RPC quorum', () => {
+    const RPCS = ['https://rpc-a', 'https://rpc-b', 'https://rpc-c'];
+    const answer = (word) => ({
+        ok: true,
+        json: async () => ({ result: '0x' + word.padStart(64, '0') }),
+    });
+
+    beforeEach(() => {
+        vi.stubGlobal('fetch', vi.fn());
+    });
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+    });
+
+    it('returns as soon as two endpoints say the same thing', async () => {
+        fetch.mockResolvedValue(answer('1'));
+        const res = await evmCall(RPCS, '0xcontract', '0xfdab463d', 2);
+        expect(res).toBe('0x' + '1'.padStart(64, '0'));
+        expect(fetch).toHaveBeenCalledTimes(2);
+    });
+
+    it('a lone dissenting endpoint cannot decide the answer', async () => {
+        // rpc-a is the hostile one: it invents a root, the honest two agree on another
+        fetch
+            .mockResolvedValueOnce(answer('dead'))
+            .mockResolvedValueOnce(answer('beef'))
+            .mockResolvedValueOnce(answer('beef'));
+        const res = await evmCall(RPCS, '0xcontract', '0xfdab463d', 2);
+        expect(res).toBe('0x' + 'beef'.padStart(64, '0'));
+        expect(fetch).toHaveBeenCalledTimes(3);
+    });
+
+    it('throws rather than picking a side when no answer reaches the quorum', async () => {
+        fetch
+            .mockResolvedValueOnce(answer('1'))
+            .mockResolvedValueOnce(answer('2'))
+            .mockResolvedValueOnce(answer('3'));
+        await expect(
+            evmCall(RPCS, '0xcontract', '0xfdab463d', 2)
+        ).rejects.toThrow(/disagree/);
+    });
+
+    it('throws when only one endpoint is reachable and two are required', async () => {
+        fetch
+            .mockResolvedValueOnce(answer('1'))
+            .mockRejectedValue(new Error('down'));
+        await expect(
+            evmCall(RPCS, '0xcontract', '0xfdab463d', 2)
+        ).rejects.toThrow(/failed/);
+    });
+
+    // A user who deliberately configured one endpoint has no second opinion to be had;
+    // asking the same node twice would be theatre, not a quorum.
+    it('falls back to one endpoint when only one is configured', async () => {
+        fetch.mockResolvedValue(answer('1'));
+        await expect(
+            evmCall('https://rpc-only', '0xcontract', '0xfdab463d', 2)
+        ).resolves.toBeTruthy();
+        expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('reads the root and the validity flag under quorum by default', async () => {
+        fetch.mockResolvedValue(answer('1'));
+        await verifyRootValidityOnContract(
+            RPCS,
+            '0xcontract',
+            LIVE_VECTOR.smt_root
+        );
+        expect(fetch).toHaveBeenCalledTimes(MIN_RPC_AGREEMENT);
     });
 });

@@ -299,6 +299,9 @@ pinsBtnSend = "Send"
 pinsBtnSendAnyway = "Send anyway"
 pinsBtnCancel = "Cancel"
 pinsBtnRetry = "Retry"
+pinsTitleRootTooOld = "⚠️ Outdated Indexer State"
+pinsTextRootTooOld = "The Name Service indexer is serving a state root that is {nLag} PIVX blocks behind the blockchain. A root this old cannot be trusted to describe the current owner of this name, so sending is blocked."
+pinsTextSyncDelayLag = "The indexer's state root is {nLag} PIVX blocks behind (roughly one minute per block)."
 
 [ALERTS]
 INTERNAL_ERROR = "Internal error, please try again later"
